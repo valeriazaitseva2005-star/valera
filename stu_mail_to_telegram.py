@@ -17,6 +17,7 @@
 import email
 import html
 import imaplib
+import json
 import os
 import re
 import time
@@ -26,7 +27,8 @@ from email.header import decode_header, make_header
 
 IMAP_HOST = "imap.stuba.sk"
 IMAP_PORT = 993
-FLAG = "TgNotified"
+STATE_FILE = os.environ.get("STATE_FILE", "notified.json")
+MAX_REMEMBERED = 1000
 CHECK_EVERY_SECONDS = 60
 MAX_BODY_CHARS = 3000  # Telegram дозволяє до 4096 символів в одному повідомленні
 
@@ -89,31 +91,65 @@ def send_telegram(text):
     urllib.request.urlopen(url, data=data, timeout=20)
 
 
+def load_state():
+    """Повертає (список уже оголошених Message-ID, чи існував файл)."""
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            return json.load(f), True
+    except (FileNotFoundError, json.JSONDecodeError):
+        return [], False
+
+
+def save_state(ids):
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(ids[-MAX_REMEMBERED:], f)
+
+
 def check_mail():
+    seen_list, state_existed = load_state()
+    seen = set(seen_list)
+
     mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
     mail.login(USER, PASSWORD)
     mail.select("INBOX")
 
-    # Непрочитані листи, про які ще не надсилали сповіщення
-    _, data = mail.uid("search", None, "UNSEEN", "UNKEYWORD", FLAG)
-    uids = data[0].split()
+    _, data = mail.uid("search", None, "UNSEEN")
+    sent = 0
 
-    for uid in uids:
-        # BODY.PEEK читає лист, не позначаючи його прочитаним
-        _, msg_data = mail.uid("fetch", uid, "(BODY.PEEK[])")
-        msg = email.message_from_bytes(msg_data[0][1])
-        sender = decode(msg.get("From"))
-        subject = decode(msg.get("Subject")) or "(без теми)"
-        body, attachments = get_body_and_attachments(msg)
+    for uid in data[0].split():
+        # Спершу дістаємо лише Message-ID, щоб не завантажувати старі листи
+        _, id_data = mail.uid(
+            "fetch", uid, "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])"
+        )
+        header = email.message_from_bytes(id_data[0][1])
+        msg_id = (header.get("Message-ID") or f"uid-{uid.decode()}").strip()
+        if msg_id in seen:
+            continue
 
-        text = f"📬 Новий лист STU\n\nВід: {sender}\nТема: {subject}\n\n{body}"
-        if attachments:
-            text += "\n\n📎 Вкладення: " + ", ".join(attachments)
-        send_telegram(text)
-        mail.uid("store", uid, "+FLAGS", f"({FLAG})")
+        # При найпершому запуску лише запам'ятовуємо наявні листи, без сповіщень
+        if state_existed:
+            # BODY.PEEK читає лист, не позначаючи його прочитаним
+            _, msg_data = mail.uid("fetch", uid, "(BODY.PEEK[])")
+            msg = email.message_from_bytes(msg_data[0][1])
+            sender = decode(msg.get("From"))
+            subject = decode(msg.get("Subject")) or "(без теми)"
+            body, attachments = get_body_and_attachments(msg)
+
+            text = f"📬 Новий лист STU\n\nВід: {sender}\nТема: {subject}\n\n{body}"
+            if attachments:
+                text += "\n\n📎 Вкладення: " + ", ".join(attachments)
+            send_telegram(text)
+            sent += 1
+
+        seen_list.append(msg_id)
+        seen.add(msg_id)
+        save_state(seen_list)  # зберігаємо одразу, щоб не було дублів при збої
+
+    if not state_existed:
+        save_state(seen_list)
 
     mail.logout()
-    return len(uids)
+    return sent
 
 
 def main():
